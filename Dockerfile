@@ -4,6 +4,7 @@ ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod go.sum ./
 RUN go mod download
 COPY main.go .
+COPY templates/ templates/
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o navitape .
 
 FROM alpine:3.21

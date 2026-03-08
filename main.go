@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -18,7 +20,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	_ "modernc.org/sqlite"
 )
 
 // ── Config ────────────────────────────────────────────────────────
@@ -48,7 +51,75 @@ func getEnv(k, def string) string {
 
 // ── DB ────────────────────────────────────────────────────────────
 
-var db *pgxpool.Pool
+var (
+	db       *sql.DB
+	dbDriver string // "pgx" | "sqlite"
+)
+
+// ph returns the nth placeholder ($n for postgres, ? for sqlite)
+func ph(n int) string {
+	if dbDriver == "sqlite" {
+		return "?"
+	}
+	return fmt.Sprintf("$%d", n)
+}
+
+// jsonArrayLen returns DB-appropriate json array length expression
+func jsonArrayLen(col string) string {
+	if dbDriver == "sqlite" {
+		return "json_array_length(" + col + ")"
+	}
+	return "jsonb_array_length(" + col + ")"
+}
+
+func initDB(ctx context.Context) {
+	dsn := mustEnv("DATABASE_URL")
+
+	var driverDSN string
+	switch {
+	case strings.HasPrefix(dsn, "postgres://"), strings.HasPrefix(dsn, "postgresql://"):
+		dbDriver = "pgx"
+		driverDSN = dsn
+	case strings.HasPrefix(dsn, "sqlite://"):
+		dbDriver = "sqlite"
+		driverDSN = strings.TrimPrefix(dsn, "sqlite://")
+	default:
+		// bare path → sqlite
+		dbDriver = "sqlite"
+		driverDSN = dsn
+	}
+
+	var err error
+	db, err = sql.Open(dbDriver, driverDSN)
+	if err != nil {
+		log.Fatalf("db open: %v", err)
+	}
+	if err = db.PingContext(ctx); err != nil {
+		log.Fatalf("db ping: %v", err)
+	}
+
+	tracksColDef := "JSONB NOT NULL DEFAULT '[]'"
+	timeDef := "TIMESTAMPTZ"
+	if dbDriver == "sqlite" {
+		tracksColDef = "TEXT NOT NULL DEFAULT '[]'"
+		timeDef = "DATETIME"
+	}
+
+	_, err = db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS navidrome_shares (
+			token       TEXT PRIMARY KEY,
+			label       TEXT NOT NULL DEFAULT '',
+			tracks      %s,
+			created_at  %s NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			expires_at  %s
+		)`, tracksColDef, timeDef, timeDef))
+	if err != nil {
+		log.Fatalf("db init: %v", err)
+	}
+	log.Printf("db ready (%s)", dbDriver)
+}
+
+// ── Model ─────────────────────────────────────────────────────────
 
 type Track struct {
 	ID       string `json:"id"`
@@ -66,38 +137,22 @@ type Share struct {
 	ExpiresAt *time.Time
 }
 
-func initDB(ctx context.Context) {
-	var err error
-	db, err = pgxpool.New(ctx, mustEnv("DATABASE_URL"))
-	if err != nil {
-		log.Fatalf("db connect: %v", err)
-	}
-	_, err = db.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS navidrome_shares (
-			token       TEXT PRIMARY KEY,
-			label       TEXT NOT NULL DEFAULT '',
-			tracks      JSONB NOT NULL DEFAULT '[]',
-			created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			expires_at  TIMESTAMPTZ
-		)
-	`)
-	if err != nil {
-		log.Fatalf("db init: %v", err)
-	}
-	log.Println("db ready")
-}
-
 func getShare(ctx context.Context, token string) (*Share, error) {
 	var s Share
-	var tracksJSON []byte
-	err := db.QueryRow(ctx,
-		"SELECT token, label, tracks, created_at, expires_at FROM navidrome_shares WHERE token=$1",
+	var tracksJSON string
+	var expiresAt sql.NullTime
+
+	err := db.QueryRowContext(ctx,
+		fmt.Sprintf("SELECT token, label, tracks, created_at, expires_at FROM navidrome_shares WHERE token=%s", ph(1)),
 		token,
-	).Scan(&s.Token, &s.Label, &tracksJSON, &s.CreatedAt, &s.ExpiresAt)
+	).Scan(&s.Token, &s.Label, &tracksJSON, &s.CreatedAt, &expiresAt)
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(tracksJSON, &s.Tracks); err != nil {
+	if expiresAt.Valid {
+		s.ExpiresAt = &expiresAt.Time
+	}
+	if err := json.Unmarshal([]byte(tracksJSON), &s.Tracks); err != nil {
 		return nil, err
 	}
 	return &s, nil
@@ -185,111 +240,20 @@ func parseTTL(s string) (*time.Time, error) {
 	return &t, nil
 }
 
-// ── Player template ───────────────────────────────────────────────
+// ── Template ──────────────────────────────────────────────────────
 
-var playerTmpl = template.Must(template.New("player").Funcs(template.FuncMap{
-	"durStr": func(secs int) string {
-		return fmt.Sprintf("%d:%02d", secs/60, secs%60)
-	},
-}).Parse(`<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{{.Label}}</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#121212;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}
-.header{padding:32px 24px 16px;background:linear-gradient(180deg,#1e1e2e 0%,#121212 100%)}
-.header h1{font-size:28px;font-weight:700}
-.expires{font-size:12px;color:#888;margin-top:6px}
-.player{position:sticky;top:0;background:#1a1a2e;padding:16px 24px;z-index:10;border-bottom:1px solid #333}
-.now-playing{font-size:13px;color:#aaa;margin-bottom:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-audio{width:100%;accent-color:#7c6af7}
-.tracks{padding:8px 0 80px}
-.track{display:flex;align-items:center;gap:12px;padding:10px 24px;cursor:pointer;transition:background 0.15s}
-.track:hover{background:#1e1e1e}
-.track.active{background:#2a2a3e}
-.cover{width:48px;height:48px;border-radius:4px;object-fit:cover;background:#333;flex-shrink:0}
-.info{flex:1;overflow:hidden}
-.title{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.artist{font-size:12px;color:#888;margin-top:2px}
-.duration{font-size:12px;color:#666;flex-shrink:0}
-.track-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
-.dl-btn{background:none;border:none;color:#888;cursor:pointer;font-size:16px;padding:4px;line-height:1;transition:color 0.15s}
-.dl-btn:hover{color:#e0e0e0}
-.quality-toggle{display:flex;gap:4px;margin-top:8px}
-.quality-btn{background:none;border:1px solid #444;border-radius:4px;color:#888;cursor:pointer;font-size:11px;padding:3px 8px;transition:all 0.15s}
-.quality-btn.active{background:#7c6af7;border-color:#7c6af7;color:#fff}
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>{{.Label}}</h1>
-  {{if .ExpiresAt}}<p class="expires">Expires {{.ExpiresAt.Format "2006-01-02 15:04 UTC"}}</p>{{end}}
-</div>
-<div class="player">
-  <div class="now-playing" id="np">Select a track to play</div>
-  <audio id="audio" controls preload="none"></audio>
-  <div class="quality-toggle">
-    <button class="quality-btn active" id="q-flac" onclick="setQuality('flac')">FLAC</button>
-    <button class="quality-btn" id="q-mp3" onclick="setQuality('mp3')">MP3 320k</button>
-  </div>
-</div>
-<div class="tracks">
-{{range $i, $t := .Tracks}}
-<div class="track" data-index="{{$i}}" onclick="play({{$i}})">
-  <img class="cover" src="/s/{{$.Token}}/art/{{$t.ID}}" onerror="this.style.display='none'">
-  <div class="info">
-    <div class="title">{{$t.Title}}</div>
-    <div class="artist">{{$t.Artist}}</div>
-  </div>
-  <div class="track-actions">
-    <div class="duration">{{durStr $t.Duration}}</div>
-    <a class="dl-btn" href="/s/{{$.Token}}/download/{{$t.ID}}" download title="Download FLAC">⬇</a>
-  </div>
-</div>
-{{end}}
-</div>
-<script>
-const tracks={{.TracksJSON}};
-const token="{{.Token}}";
-let cur=-1;
-let quality="flac";
-const audio=document.getElementById('audio');
+//go:embed templates/player.html
+var playerTmplStr string
 
-function setQuality(q){
-  quality=q;
-  document.getElementById('q-flac').classList.toggle('active',q==='flac');
-  document.getElementById('q-mp3').classList.toggle('active',q==='mp3');
-  if(cur>=0){
-    const t=tracks[cur];
-    const pos=audio.currentTime;
-    audio.src=streamUrl(t.id);
-    audio.currentTime=pos;
-    audio.play();
-  }
+var playerTmpl *template.Template
+
+func init() {
+	playerTmpl = template.Must(template.New("player").Funcs(template.FuncMap{
+		"durStr": func(secs int) string {
+			return fmt.Sprintf("%d:%02d", secs/60, secs%60)
+		},
+	}).Parse(playerTmplStr))
 }
-
-function streamUrl(id){
-  return quality==='mp3'
-    ? "/s/"+token+"/stream/"+id+"?format=mp3"
-    : "/s/"+token+"/stream/"+id;
-}
-
-function play(i){
-  if(i<0||i>=tracks.length)return;
-  cur=i;
-  const t=tracks[i];
-  audio.src=streamUrl(t.id);
-  audio.play();
-  document.getElementById('np').textContent=t.title+(t.artist?' — '+t.artist:'');
-  document.querySelectorAll('.track').forEach((el,idx)=>el.classList.toggle('active',idx===i));
-}
-audio.addEventListener('ended',()=>play(cur+1));
-</script>
-</body>
-</html>`))
 
 type playerData struct {
 	*Share
@@ -326,7 +290,7 @@ func proxyTrack(w http.ResponseWriter, r *http.Request, token, songID string, do
 	}
 
 	params := map[string]string{"id": songID}
-	if f := r.URL.Query().Get("format"); f == "mp3" {
+	if r.URL.Query().Get("format") == "mp3" {
 		params["format"] = "mp3"
 		params["maxBitRate"] = "320"
 	}
@@ -346,10 +310,8 @@ func proxyTrack(w http.ResponseWriter, r *http.Request, token, songID string, do
 		}
 	}
 	if download {
-		// find track title for filename
-		title := songID
-		ext := "flac"
-		if ct := resp.Header.Get("Content-Type"); ct != "" && (ct == "audio/mpeg" || ct == "audio/mp3") {
+		title, ext := songID, "flac"
+		if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "mpeg") {
 			ext = "mp3"
 		}
 		for _, t := range share.Tracks {
@@ -423,14 +385,10 @@ func handleCreateShare(w http.ResponseWriter, r *http.Request) {
 		if label == "" {
 			label = strVal(pl, "name")
 		}
-		for _, e := range pl["entry"].([]any) {
+		entries, _ := pl["entry"].([]any)
+		for _, e := range entries {
 			entry := e.(map[string]any)
-			t := Track{
-				ID:     strVal(entry, "id"),
-				Title:  strVal(entry, "title"),
-				Artist: strVal(entry, "artist"),
-				Album:  strVal(entry, "album"),
-			}
+			t := Track{ID: strVal(entry, "id"), Title: strVal(entry, "title"), Artist: strVal(entry, "artist"), Album: strVal(entry, "album")}
 			if d, ok := entry["duration"].(float64); ok {
 				t.Duration = int(d)
 			}
@@ -448,12 +406,7 @@ func handleCreateShare(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s := data["song"].(map[string]any)
-			t := Track{
-				ID:     strVal(s, "id"),
-				Title:  strVal(s, "title"),
-				Artist: strVal(s, "artist"),
-				Album:  strVal(s, "album"),
-			}
+			t := Track{ID: strVal(s, "id"), Title: strVal(s, "title"), Artist: strVal(s, "artist"), Album: strVal(s, "album")}
 			if d, ok := s["duration"].(float64); ok {
 				t.Duration = int(d)
 			}
@@ -474,9 +427,15 @@ func handleCreateShare(w http.ResponseWriter, r *http.Request) {
 	token := newToken()
 	tracksJSON, _ := json.Marshal(tracks)
 
-	if _, err = db.Exec(r.Context(),
-		"INSERT INTO navidrome_shares (token, label, tracks, expires_at) VALUES ($1,$2,$3,$4)",
-		token, label, tracksJSON, expiresAt,
+	var expiresVal any
+	if expiresAt != nil {
+		expiresVal = *expiresAt
+	}
+
+	if _, err = db.ExecContext(r.Context(),
+		fmt.Sprintf("INSERT INTO navidrome_shares (token, label, tracks, expires_at) VALUES (%s,%s,%s,%s)",
+			ph(1), ph(2), ph(3), ph(4)),
+		token, label, string(tracksJSON), expiresVal,
 	); err != nil {
 		http.Error(w, "db error: "+err.Error(), 500)
 		return
@@ -484,32 +443,35 @@ func handleCreateShare(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"token":      token,
-		"url":        fmt.Sprintf("%s/s/%s", baseURL, token),
-		"label":      label,
-		"tracks":     len(tracks),
-		"expires_at": expiresAt,
+		"token": token, "url": fmt.Sprintf("%s/s/%s", baseURL, token),
+		"label": label, "tracks": len(tracks), "expires_at": expiresAt,
 	})
 }
 
 func handleListShares(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query(r.Context(),
-		"SELECT token, label, created_at, expires_at, jsonb_array_length(tracks) FROM navidrome_shares ORDER BY created_at DESC")
+	rows, err := db.QueryContext(r.Context(),
+		fmt.Sprintf("SELECT token, label, created_at, expires_at, %s FROM navidrome_shares ORDER BY created_at DESC",
+			jsonArrayLen("tracks")))
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	defer rows.Close()
+
 	var result []map[string]any
 	for rows.Next() {
 		var token, label string
 		var createdAt time.Time
-		var expiresAt *time.Time
+		var expiresAt sql.NullTime
 		var trackCount int
 		rows.Scan(&token, &label, &createdAt, &expiresAt, &trackCount)
+		var exp any
+		if expiresAt.Valid {
+			exp = expiresAt.Time
+		}
 		result = append(result, map[string]any{
 			"token": token, "label": label,
-			"created_at": createdAt, "expires_at": expiresAt,
+			"created_at": createdAt, "expires_at": exp,
 			"track_count": trackCount,
 		})
 	}
@@ -522,8 +484,14 @@ func handleListShares(w http.ResponseWriter, r *http.Request) {
 
 func handleDeleteShare(w http.ResponseWriter, r *http.Request) {
 	token := chi.URLParam(r, "token")
-	tag, err := db.Exec(r.Context(), "DELETE FROM navidrome_shares WHERE token=$1", token)
-	if err != nil || tag.RowsAffected() == 0 {
+	res, err := db.ExecContext(r.Context(),
+		fmt.Sprintf("DELETE FROM navidrome_shares WHERE token=%s", ph(1)), token)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
 		http.Error(w, "not found", 404)
 		return
 	}
