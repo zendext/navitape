@@ -215,6 +215,12 @@ audio{width:100%;accent-color:#7c6af7}
 .title{font-size:14px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .artist{font-size:12px;color:#888;margin-top:2px}
 .duration{font-size:12px;color:#666;flex-shrink:0}
+.track-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.dl-btn{background:none;border:none;color:#888;cursor:pointer;font-size:16px;padding:4px;line-height:1;transition:color 0.15s}
+.dl-btn:hover{color:#e0e0e0}
+.quality-toggle{display:flex;gap:4px;margin-top:8px}
+.quality-btn{background:none;border:1px solid #444;border-radius:4px;color:#888;cursor:pointer;font-size:11px;padding:3px 8px;transition:all 0.15s}
+.quality-btn.active{background:#7c6af7;border-color:#7c6af7;color:#fff}
 </style>
 </head>
 <body>
@@ -225,6 +231,10 @@ audio{width:100%;accent-color:#7c6af7}
 <div class="player">
   <div class="now-playing" id="np">Select a track to play</div>
   <audio id="audio" controls preload="none"></audio>
+  <div class="quality-toggle">
+    <button class="quality-btn active" id="q-flac" onclick="setQuality('flac')">FLAC</button>
+    <button class="quality-btn" id="q-mp3" onclick="setQuality('mp3')">MP3 320k</button>
+  </div>
 </div>
 <div class="tracks">
 {{range $i, $t := .Tracks}}
@@ -234,7 +244,10 @@ audio{width:100%;accent-color:#7c6af7}
     <div class="title">{{$t.Title}}</div>
     <div class="artist">{{$t.Artist}}</div>
   </div>
-  <div class="duration">{{durStr $t.Duration}}</div>
+  <div class="track-actions">
+    <div class="duration">{{durStr $t.Duration}}</div>
+    <a class="dl-btn" href="/s/{{$.Token}}/download/{{$t.ID}}" download title="Download FLAC">⬇</a>
+  </div>
 </div>
 {{end}}
 </div>
@@ -242,12 +255,33 @@ audio{width:100%;accent-color:#7c6af7}
 const tracks={{.TracksJSON}};
 const token="{{.Token}}";
 let cur=-1;
+let quality="flac";
 const audio=document.getElementById('audio');
+
+function setQuality(q){
+  quality=q;
+  document.getElementById('q-flac').classList.toggle('active',q==='flac');
+  document.getElementById('q-mp3').classList.toggle('active',q==='mp3');
+  if(cur>=0){
+    const t=tracks[cur];
+    const pos=audio.currentTime;
+    audio.src=streamUrl(t.id);
+    audio.currentTime=pos;
+    audio.play();
+  }
+}
+
+function streamUrl(id){
+  return quality==='mp3'
+    ? "/s/"+token+"/stream/"+id+"?format=mp3"
+    : "/s/"+token+"/stream/"+id;
+}
+
 function play(i){
   if(i<0||i>=tracks.length)return;
   cur=i;
   const t=tracks[i];
-  audio.src="/s/"+token+"/stream/"+t.id;
+  audio.src=streamUrl(t.id);
   audio.play();
   document.getElementById('np').textContent=t.title+(t.artist?' — '+t.artist:'');
   document.querySelectorAll('.track').forEach((el,idx)=>el.classList.toggle('active',idx===i));
@@ -280,9 +314,7 @@ func handleSharePage(w http.ResponseWriter, r *http.Request) {
 	playerTmpl.Execute(w, playerData{share, template.JS(tj)})
 }
 
-func handleStream(w http.ResponseWriter, r *http.Request) {
-	token := chi.URLParam(r, "token")
-	songID := chi.URLParam(r, "songID")
+func proxyTrack(w http.ResponseWriter, r *http.Request, token, songID string, download bool) {
 	share, err := getShare(r.Context(), token)
 	if err != nil || !share.hasTrack(songID) {
 		http.Error(w, "Forbidden", 403)
@@ -292,7 +324,14 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Expired", 410)
 		return
 	}
-	u := fmt.Sprintf("%s/rest/stream.view?%s", naviURL, naviParams(map[string]string{"id": songID}).Encode())
+
+	params := map[string]string{"id": songID}
+	if f := r.URL.Query().Get("format"); f == "mp3" {
+		params["format"] = "mp3"
+		params["maxBitRate"] = "320"
+	}
+
+	u := fmt.Sprintf("%s/rest/stream.view?%s", naviURL, naviParams(params).Encode())
 	req, _ := http.NewRequestWithContext(r.Context(), "GET", u, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -300,13 +339,37 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
 	for _, h := range []string{"Content-Type", "Content-Length", "Accept-Ranges"} {
 		if v := resp.Header.Get(h); v != "" {
 			w.Header().Set(h, v)
 		}
 	}
+	if download {
+		// find track title for filename
+		title := songID
+		ext := "flac"
+		if ct := resp.Header.Get("Content-Type"); ct != "" && (ct == "audio/mpeg" || ct == "audio/mp3") {
+			ext = "mp3"
+		}
+		for _, t := range share.Tracks {
+			if t.ID == songID {
+				title = t.Title
+				break
+			}
+		}
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.%s"`, title, ext))
+	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func handleStream(w http.ResponseWriter, r *http.Request) {
+	proxyTrack(w, r, chi.URLParam(r, "token"), chi.URLParam(r, "songID"), false)
+}
+
+func handleDownload(w http.ResponseWriter, r *http.Request) {
+	proxyTrack(w, r, chi.URLParam(r, "token"), chi.URLParam(r, "songID"), true)
 }
 
 func handleArt(w http.ResponseWriter, r *http.Request) {
@@ -480,6 +543,7 @@ func main() {
 
 	r.Get("/s/{token}", handleSharePage)
 	r.Get("/s/{token}/stream/{songID}", handleStream)
+	r.Get("/s/{token}/download/{songID}", handleDownload)
 	r.Get("/s/{token}/art/{songID}", handleArt)
 
 	r.Post("/admin/share", handleCreateShare)
